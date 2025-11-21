@@ -4,6 +4,9 @@ import numpy as np
 import glob
 from math import hypot
 
+# CRITICAL PARAMETER FOR PRUNING:
+MAX_REPROJ_ERROR_FOR_PRUNING = 1.0 # Discard any board with an error higher than 1.0 pixel.
+
 # ======================= USER CONFIGURABLE PARAMETERS =======================
 calibration_images_path = 'Final_Project/data/34759_final_project_raw/calib/image_02/data'
 SAVE_CALIBRATION = "Final_Project/models/stereo_calibration.npz"
@@ -20,10 +23,10 @@ DIAG_DIR = os.path.join(os.path.dirname(SAVE_CALIBRATION), "diagnostics")
 os.makedirs(DIAG_DIR, exist_ok=True)
 # ======================= END OF USER CONFIGURABLE PARAMETERS =================
 
-
 def _refine_corners(gray, corners):
+    # Increased max_iter for sub-pixel refinement
     return cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1),
-                            (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 1e-4))
+                            (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-4))
 
 
 def preprocess_versions(gray):
@@ -152,6 +155,29 @@ def match_boards(left_boards, right_boards, max_dist=MAX_MATCH_DISTANCE_PX):
             matches.append((l, right_boards[best]))
     return matches
 
+def prune_outliers(objPointss, imgPointssL, imgPointssR, mtxL, distL, rvecsL, tvecsL, threshold=1.0):
+    """Prunes image points that result in a reprojection error above the threshold."""
+    new_objPointss = []
+    new_imgPointssL = []
+    new_imgPointssR = []
+    rejected_count = 0
+
+    # Calculate reprojection error for each set of points
+    for i in range(len(objPointss)):
+        imgpoints_reproj, _ = cv2.projectPoints(objPointss[i], rvecsL[i], tvecsL[i], mtxL, distL)
+        
+        # Calculate the error for this board
+        error = cv2.norm(imgPointssL[i], imgpoints_reproj, cv2.NORM_L2) / len(imgPointssL[i])
+        
+        if error <= threshold:
+            new_objPointss.append(objPointss[i])
+            new_imgPointssL.append(imgPointssL[i])
+            new_imgPointssR.append(imgPointssR[i])
+        else:
+            rejected_count += 1
+            
+    return new_objPointss, new_imgPointssL, new_imgPointssR, rejected_count
+
 
 def main():
     print("Starting stereo camera calibration...")
@@ -178,6 +204,7 @@ def main():
     total_detections = 0
     total_matches = 0
 
+    # Data collection loop (with diagnostics re-enabled)
     for idx, (lf, rf) in enumerate(zip(left_images, right_images)):
         left_color = cv2.imread(lf)
         right_color = cv2.imread(rf)
@@ -210,8 +237,8 @@ def main():
             objPointss.append(objp)
             imgPointssL.append(l['corners'])
             imgPointssR.append(r['corners'])
-
-        # Diagnostics image
+        
+        # Diagnostics image (RE-ENABLED)
         diag = np.hstack((left_color.copy(), right_color.copy()))
         w = left_color.shape[1]
         for b in left_boards:
@@ -228,37 +255,75 @@ def main():
         diag_path = os.path.join(DIAG_DIR, f'pair_{idx:03d}_{os.path.basename(lf)}')
         if not diag_path.lower().endswith('.png'):
             diag_path += '.png'
-        cv2.imwrite(diag_path, diag)
+        cv2.imwrite(diag_path, diag) # Write the diagnostics image
 
     print(f"Total detections: {total_detections}, matched pairs: {total_matches}")
-    print(f"Final correspondences: {len(objPointss)}")
-    if len(objPointss) == 0:
+    initial_correspondences = len(objPointss)
+    print(f"Final correspondences (initial set): {initial_correspondences}")
+    if initial_correspondences == 0:
         print(f"No matched boards found. Check diagnostics in {DIAG_DIR}")
         return
 
     # Trim lists to equal length
-    min_len = min(len(objPointss), len(imgPointssL), len(imgPointssR))
-    objPointss = objPointss[:min_len]
-    imgPointssL = imgPointssL[:min_len]
-    imgPointssR = imgPointssR[:min_len]
-
     img_shape = (left_gray.shape[1], left_gray.shape[0])
 
-    # Calibrate individual cameras
-    print("Calibrating left camera...")
-    retL, mtxL, distL, rvecsL, tvecsL = cv2.calibrateCamera(objPointss, imgPointssL, img_shape, None, None)
-    print("Calibrating right camera...")
-    retR, mtxR, distR, rvecsR, tvecsR = cv2.calibrateCamera(objPointss, imgPointssR, img_shape, None, None)
+    # --- Step 1: Preliminary Single Calibration for Pruning ---
+    print("\n--- Calibration Pass 1: For Data Pruning ---")
+    # Use standard 5-coefficient model (K1, K2, P1, P2, K3) for stability
+    single_calib_flags = (cv2.CALIB_FIX_K4 | cv2.CALIB_FIX_K5 | cv2.CALIB_FIX_K6 | cv2.CALIB_FIX_PRINCIPAL_POINT)
+    retL_init, mtxL_init, distL_init, rvecsL_init, tvecsL_init = cv2.calibrateCamera(
+        objPointss, imgPointssL, img_shape, None, None, flags=single_calib_flags
+    )
+    print(f"Initial Left Camera Reprojection Error: {retL_init:.3f}")
 
-    # Stereo calibration
+    # --- Step 2: Prune Outliers ---
+    objPointss_pruned, imgPointssL_pruned, imgPointssR_pruned, rejected_count = prune_outliers(
+        objPointss, imgPointssL, imgPointssR, 
+        mtxL_init, distL_init, rvecsL_init, tvecsL_init, 
+        threshold=MAX_REPROJ_ERROR_FOR_PRUNING
+    )
+    
+    print(f"Pruning complete: Rejected {rejected_count} board(s) with error > {MAX_REPROJ_ERROR_FOR_PRUNING} pixel.")
+    pruned_correspondences = len(objPointss_pruned)
+    print(f"Final correspondences (pruned set): {pruned_correspondences}")
+
+    if pruned_correspondences < 10:
+        print("\n⚠️ WARNING: Not enough high-quality data remains for robust calibration. You must capture more data.")
+    
+    # Use the pruned data set for the final calibration pass
+    objPointss = objPointss_pruned
+    imgPointssL = imgPointssL_pruned
+    imgPointssR = imgPointssR_pruned
+
+    # --- Step 3: Final Single and Stereo Calibration with Pruned Data ---
+    print("\n--- Calibration Pass 2: Final Calibration ---")
+    
+    print("Calibrating left camera...")
+    retL, mtxL, distL, rvecsL, tvecsL = cv2.calibrateCamera(
+        objPointss, imgPointssL, img_shape, None, None, flags=single_calib_flags
+    )
+    print(f"Left camera reprojection error: {retL:.3f}")
+
+    print("Calibrating right camera...")
+    retR, mtxR, distR, rvecsR, tvecsR = cv2.calibrateCamera(
+        objPointss, imgPointssR, img_shape, None, None, flags=single_calib_flags
+    )
+    print(f"Right camera reprojection error: {retR:.3f}")
+
     print("Running stereoCalibrate...")
-    flags = cv2.CALIB_FIX_INTRINSIC
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, 1e-6)
-    ret, _, _, _, _, R, T, E, F = cv2.stereoCalibrate(
+    # REVERTED: Using CALIB_USE_INTRINSIC_GUESS to allow the solver more flexibility with sparse data
+    stereo_flags = (cv2.CALIB_USE_INTRINSIC_GUESS |
+             cv2.CALIB_FIX_K1 | cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3 |
+             cv2.CALIB_FIX_TANGENT_DIST |
+             cv2.CALIB_FIX_PRINCIPAL_POINT)
+             
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 500, 1e-7)
+    ret, mtxL, distL, mtxR, distR, R, T, E, F = cv2.stereoCalibrate(
         objPointss, imgPointssL, imgPointssR,
         mtxL, distL, mtxR, distR, img_shape,
-        criteria=criteria, flags=flags
+        criteria=criteria, flags=stereo_flags
     )
+    
     print(f"Stereo reprojection error: {ret:.6f}")
 
     # Rectification
@@ -291,39 +356,33 @@ def main():
     fs.release()
     print("Calibration also saved to YAML:", yaml_file)
 
-    # ----------------- SAVE calib_corners.png -----------------
+    # ----------------- SAVE final visualization files -----------------
     last_left = cv2.imread(left_images[0])
     last_right = cv2.imread(right_images[0])
-    for b in detect_multiple_boards(cv2.cvtColor(last_left, cv2.COLOR_BGR2GRAY), CHESSBOARD_CANDIDATES):
-        try:
-            cv2.drawChessboardCorners(last_left, b['size'], b['corners'], True)
-        except Exception:
-            pass
-    for b in detect_multiple_boards(cv2.cvtColor(last_right, cv2.COLOR_BGR2GRAY), CHESSBOARD_CANDIDATES):
-        try:
-            cv2.drawChessboardCorners(last_right, b['size'], b['corners'], True)
-        except Exception:
-            pass
-    cv2.imwrite(os.path.join(os.path.dirname(SAVE_CALIBRATION), 'calib_corners.png'),
-                np.hstack((last_left, last_right)))
+    
+    # Draw corners on a fresh copy
+    corners_left = last_left.copy()
+    corners_right = last_right.copy()
 
-    # ----------------- SAVE calib_rectified.png -----------------
+    for b in detect_multiple_boards(cv2.cvtColor(corners_left, cv2.COLOR_BGR2GRAY), CHESSBOARD_CANDIDATES):
+        try:
+            cv2.drawChessboardCorners(corners_left, b['size'], b['corners'], True)
+        except Exception:
+            pass
+    for b in detect_multiple_boards(cv2.cvtColor(corners_right, cv2.COLOR_BGR2GRAY), CHESSBOARD_CANDIDATES):
+        try:
+            cv2.drawChessboardCorners(corners_right, b['size'], b['corners'], True)
+        except Exception:
+            pass
+            
+    cv2.imwrite(os.path.join(os.path.dirname(SAVE_CALIBRATION), 'calib_corners.png'),
+                np.hstack((corners_left, corners_right)))
+
+    # Save rectified image
     map1x, map1y = cv2.initUndistortRectifyMap(mtxL, distL, R1, P1, img_shape, cv2.CV_32FC1)
     map2x, map2y = cv2.initUndistortRectifyMap(mtxR, distR, R2, P2, img_shape, cv2.CV_32FC1)
     rectL = cv2.remap(last_left, map1x, map1y, cv2.INTER_LINEAR)
     rectR = cv2.remap(last_right, map2x, map2y, cv2.INTER_LINEAR)
-
-    # Draw rectified corners
-    for pts in imgPointssL[0:1]:
-        pts_rect = cv2.undistortPoints(pts, mtxL, distL, R=R1, P=P1)
-        for p in pts_rect:
-            x, y = int(p[0][0]), int(p[0][1])
-            cv2.circle(rectL, (x, y), 5, (0, 0, 255), -1)
-    for pts in imgPointssR[0:1]:
-        pts_rect = cv2.undistortPoints(pts, mtxR, distR, R=R2, P=P2)
-        for p in pts_rect:
-            x, y = int(p[0][0]), int(p[0][1])
-            cv2.circle(rectR, (x, y), 5, (0, 0, 255), -1)
 
     # Draw horizontal lines
     h = rectL.shape[0]
@@ -336,7 +395,7 @@ def main():
                 np.hstack((rectL, rectR)))
 
     print(f"Per-pair diagnostics saved in: {DIAG_DIR}")
-    print("Finished successfully.")
+    print("Finished successfully. Please run this code and report the resulting Stereo reprojection error.")
 
 
 if __name__ == "__main__":
