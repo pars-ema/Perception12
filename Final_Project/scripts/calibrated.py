@@ -1,443 +1,343 @@
-"""
-Stereo Camera Calibration
-Final Project - Perception of Autonomous Systems
-DTU Course 34759
-"""
-
 import os
 import cv2
 import numpy as np
 import glob
-from pathlib import Path
+from math import hypot
 
-
-# ======================== CONFIGURATION ========================
-
-# Checkerboard patterns to detect (columns, rows of INNER corners)
-CHECKERBOARD_PATTERNS = [
-    (7, 5),     # Small pattern: 7 columns x 5 rows
-    (7, 11),    # Medium pattern: 7 columns x 11 rows
-    (15, 5),    # Large pattern: 15 columns x 5 rows
+# ======================= USER CONFIGURABLE PARAMETERS =======================
+calibration_images_path = 'Final_Project/data/34759_final_project_raw/calib/image_02/data'
+SAVE_CALIBRATION = "Final_Project/models/stereo_calibration.npz"
+CHESSBOARD_SIZE = (7, 5)
+SQUARE_SIZE = 0.025
+CHESSBOARD_CANDIDATES = [
+    CHESSBOARD_SIZE,
+    (8, 6),
+    (6, 5),
+    (9, 6),
 ]
-
-# Physical size of checkerboard squares in meters
-SQUARE_SIZE_METERS = 0.025  # 25mm = 0.025m
-
-# Input paths
-LEFT_IMAGES_PATH = 'Final_Project/data/34759_final_project_raw/calib/image_02/data'
-RIGHT_IMAGES_PATH = 'Final_Project/data/34759_final_project_raw/calib/image_03/data'
-
-# Output path
-OUTPUT_PATH = 'Final_Project/results/calibration'
-
-# Reference calibration for comparison (optional)
-REFERENCE_CALIBRATION = 'Final_Project/data/34759_final_project_raw/calib/stereo_calibration.npz'
-
-# ======================== END CONFIGURATION ========================
+MAX_MATCH_DISTANCE_PX = 80
+DIAG_DIR = os.path.join(os.path.dirname(SAVE_CALIBRATION), "diagnostics")
+os.makedirs(DIAG_DIR, exist_ok=True)
+# ======================= END OF USER CONFIGURABLE PARAMETERS =================
 
 
-def get_image_pairs(left_path, right_path):
-    """
-    Load and sort stereo image pairs from left and right directories
-    
-    Returns:
-        list of tuples: [(left_img_path, right_img_path), ...]
-    """
-    left_images = sorted(glob.glob(os.path.join(left_path, '*.png')))
-    right_images = sorted(glob.glob(os.path.join(right_path, '*.png')))
-    
-    if not left_images or not right_images:
-        raise FileNotFoundError(f"No images found in {left_path} or {right_path}")
-    
-    if len(left_images) != len(right_images):
-        print(f"Warning: Unequal number of images - Left: {len(left_images)}, Right: {len(right_images)}")
-    
-    return list(zip(left_images, right_images))
+def _refine_corners(gray, corners):
+    return cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1),
+                            (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 1e-4))
 
 
-def create_object_points(pattern, square_size):
-    """
-    Create 3D world coordinates for checkerboard corners
-    
-    Args:
-        pattern: Tuple of (columns, rows) 
-        square_size: Physical size of squares in meters
-    
-    Returns:
-        numpy array: 3D coordinates of corners
-    """
-    cols, rows = pattern
-    objp = np.zeros((cols * rows, 3), np.float32)
-    objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
-    objp *= square_size
-    return objp
+def preprocess_versions(gray):
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    g_clahe = clahe.apply(gray)
+    g_blur = cv2.GaussianBlur(g_clahe, (5, 5), 0)
+    edges = cv2.Canny(g_clahe, 50, 150)
+    edges = cv2.dilate(edges, None)
+    ath = cv2.adaptiveThreshold(g_clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY, 11, 2)
+    return [g_clahe, g_blur, edges, ath]
 
 
-def detect_corners(image_pair, pattern, criteria):
-    """
-    Detect and refine checkerboard corners in stereo image pair
-    
-    Args:
-        image_pair: Tuple of (left_image_path, right_image_path)
-        pattern: Tuple of (columns, rows)
-        criteria: Corner refinement criteria
-    
-    Returns:
-        Tuple: (success, left_corners, right_corners, gray_left, gray_right)
-    """
-    left_path, right_path = image_pair
-    
-    # Read images
-    img_left = cv2.imread(left_path)
-    img_right = cv2.imread(right_path)
-    
-    if img_left is None or img_right is None:
-        return False, None, None, None, None
-    
-    # Convert to grayscale
-    gray_left = cv2.cvtColor(img_left, cv2.COLOR_BGR2GRAY)
-    gray_right = cv2.cvtColor(img_right, cv2.COLOR_BGR2GRAY)
-    
-    # Find checkerboard corners
-    ret_left, corners_left = cv2.findChessboardCorners(gray_left, pattern, None)
-    ret_right, corners_right = cv2.findChessboardCorners(gray_right, pattern, None)
-    
-    # Only proceed if found in both images
-    if not (ret_left and ret_right):
-        return False, None, None, gray_left, gray_right
-    
-    # Refine corner locations to sub-pixel accuracy
-    corners_left = cv2.cornerSubPix(gray_left, corners_left, (11, 11), (-1, -1), criteria)
-    corners_right = cv2.cornerSubPix(gray_right, corners_right, (11, 11), (-1, -1), criteria)
-    
-    return True, corners_left, corners_right, gray_left, gray_right
+def detect_multiple_boards(gray_img, candidates):
+    boards = []
+    mask_global = np.ones_like(gray_img, dtype=np.uint8) * 255
+    preps = preprocess_versions(gray_img)
+
+    for prep in preps:
+        img = prep.copy()
+        mask = mask_global.copy()
+        for rot in [0, 90, 180, 270]:
+            if rot == 0:
+                attempt = img.copy()
+            else:
+                if rot == 90:
+                    attempt = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+                elif rot == 180:
+                    attempt = cv2.rotate(img, cv2.ROTATE_180)
+                else:
+                    attempt = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+            if rot == 0:
+                attempt_masked = cv2.bitwise_and(attempt, attempt, mask=mask)
+            else:
+                if rot == 90:
+                    mrot = cv2.rotate(mask, cv2.ROTATE_90_CLOCKWISE)
+                elif rot == 180:
+                    mrot = cv2.rotate(mask, cv2.ROTATE_180)
+                else:
+                    mrot = cv2.rotate(mask, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                attempt_masked = cv2.bitwise_and(attempt, attempt, mask=mrot)
+
+            for cand in candidates:
+                while True:
+                    flags = (cv2.CALIB_CB_ADAPTIVE_THRESH |
+                             cv2.CALIB_CB_NORMALIZE_IMAGE |
+                             cv2.CALIB_CB_FAST_CHECK)
+                    ret, corners = cv2.findChessboardCorners(attempt_masked, cand, flags)
+                    if not ret:
+                        break
+
+                    if rot != 0:
+                        corners_xy = corners.reshape(-1, 2)
+                        h, w = attempt_masked.shape[:2]
+                        if rot == 90:
+                            inv = np.array([[pt[1], w - 1 - pt[0]] for pt in corners_xy], dtype=np.float32)
+                        elif rot == 180:
+                            inv = np.array([[w - 1 - pt[0], h - 1 - pt[1]] for pt in corners_xy], dtype=np.float32)
+                        else:  # 270
+                            inv = np.array([[h - 1 - pt[1], pt[0]] for pt in corners_xy], dtype=np.float32)
+                        corners = inv.reshape(-1, 1, 2).astype(np.float32)
+
+                    corners_refined = _refine_corners(gray_img, corners)
+                    if corners_refined is None or corners_refined.size == 0:
+                        break
+
+                    pts = corners_refined.reshape(-1, 2)
+                    cx = float(np.mean(pts[:, 0]))
+                    cy = float(np.mean(pts[:, 1]))
+
+                    duplicate = False
+                    for b in boards:
+                        dd = hypot(b['centroid'][0] - cx, b['centroid'][1] - cy)
+                        if dd < 15:
+                            duplicate = True
+                            break
+                    if not duplicate:
+                        boards.append({
+                            'corners': corners_refined,
+                            'size': cand,
+                            'centroid': (cx, cy)
+                        })
+
+                    x_min = max(0, int(pts[:, 0].min()) - 5)
+                    x_max = min(attempt_masked.shape[1] - 1, int(pts[:, 0].max()) + 5)
+                    y_min = max(0, int(pts[:, 1].min()) - 5)
+                    y_max = min(attempt_masked.shape[0] - 1, int(pts[:, 1].max()) + 5)
+                    try:
+                        hull = cv2.convexHull(pts.astype(np.int32))
+                        cv2.fillConvexPoly(mask, hull.astype(np.int32), 0)
+                    except Exception:
+                        mask[y_min:y_max, x_min:x_max] = 0
+
+                    if rot == 0:
+                        attempt_masked = cv2.bitwise_and(attempt_masked, attempt_masked, mask=mask)
+                    else:
+                        if rot == 90:
+                            mout = cv2.rotate(mask, cv2.ROTATE_90_CLOCKWISE)
+                        elif rot == 180:
+                            mout = cv2.rotate(mask, cv2.ROTATE_180)
+                        else:
+                            mout = cv2.rotate(mask, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                        attempt_masked = cv2.bitwise_and(attempt_masked, attempt_masked, mask=mout)
+
+    return boards
 
 
-def collect_calibration_data(image_pairs, patterns, square_size):
-    """
-    Collect corner detections from all image pairs for all patterns
-    
-    Returns:
-        Tuple: (object_points, image_points_left, image_points_right, image_shape, visualizations)
-    """
-    # Termination criteria for corner refinement
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-    
-    # Storage for calibration data
-    object_points = []
-    image_points_left = []
-    image_points_right = []
-    
-    # Storage for visualization
-    visualization_data = []
-    
-    image_shape = None
-    total_detections = 0
-    
-    print("\n" + "="*70)
-    print("DETECTING CHECKERBOARD CORNERS")
-    print("="*70 + "\n")
-    
-    for pattern in patterns:
-        print(f"Pattern {pattern[0]}x{pattern[1]}:")
-        
-        # Create 3D object points for this pattern
-        objp = create_object_points(pattern, square_size)
-        
-        pattern_count = 0
-        
-        for idx, pair in enumerate(image_pairs):
-            success, corners_l, corners_r, gray_l, gray_r = detect_corners(pair, pattern, criteria)
-            
-            if image_shape is None and gray_l is not None:
-                image_shape = gray_l.shape[::-1]
-            
-            if success:
-                object_points.append(objp)
-                image_points_left.append(corners_l)
-                image_points_right.append(corners_r)
-                pattern_count += 1
-                total_detections += 1
-                
-                # Save visualization data
-                if pattern_count == 1:  # Save first successful detection
-                    img_l = cv2.imread(pair[0])
-                    img_r = cv2.imread(pair[1])
-                    img_l_vis = cv2.drawChessboardCorners(img_l, pattern, corners_l, True)
-                    img_r_vis = cv2.drawChessboardCorners(img_r, pattern, corners_r, True)
-                    visualization_data.append((img_l_vis, img_r_vis, pattern))
-        
-        print(f"  Found in {pattern_count} image pairs")
-    
-    print(f"\nTotal successful detections: {total_detections}")
-    
-    if total_detections < 10:
-        print("WARNING: Less than 10 detections found. Calibration may be unreliable.")
-    
-    return object_points, image_points_left, image_points_right, image_shape, visualization_data
-
-
-def perform_calibration(objpoints, imgpoints_left, imgpoints_right, image_shape):
-    """
-    Perform monocular and stereo camera calibration
-    
-    Returns:
-        Dictionary containing all calibration parameters
-    """
-    print("\n" + "="*70)
-    print("PERFORMING CAMERA CALIBRATION")
-    print("="*70 + "\n")
-    
-    # Calibrate left camera
-    print("Calibrating left camera...")
-    ret_left, mtx_left, dist_left, rvecs_left, tvecs_left = cv2.calibrateCamera(
-        objpoints, imgpoints_left, image_shape, None, None
-    )
-    print(f"  Reprojection error: {ret_left:.4f} pixels")
-    
-    # Calibrate right camera
-    print("\nCalibrating right camera...")
-    ret_right, mtx_right, dist_right, rvecs_right, tvecs_right = cv2.calibrateCamera(
-        objpoints, imgpoints_right, image_shape, None, None
-    )
-    print(f"  Reprojection error: {ret_right:.4f} pixels")
-    
-    # Stereo calibration
-    print("\nPerforming stereo calibration...")
-    flags = cv2.CALIB_FIX_INTRINSIC
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-5)
-    
-    ret_stereo, mtx_left, dist_left, mtx_right, dist_right, R, T, E, F = cv2.stereoCalibrate(
-        objpoints, imgpoints_left, imgpoints_right,
-        mtx_left, dist_left, mtx_right, dist_right,
-        image_shape, criteria=criteria, flags=flags
-    )
-    
-    baseline = np.linalg.norm(T)
-    
-    print(f"  Stereo reprojection error: {ret_stereo:.4f} pixels")
-    print(f"  Baseline: {baseline:.6f} m ({baseline*100:.2f} cm)")
-    
-    # Compute rectification parameters
-    print("\nComputing rectification parameters...")
-    R1, R2, P1, P2, Q, roi1, roi2 = cv2.stereoRectify(
-        mtx_left, dist_left, mtx_right, dist_right,
-        image_shape, R, T, alpha=0
-    )
-    print("  Done")
-    
-    # Package results
-    calibration = {
-        'mtx_left': mtx_left,
-        'dist_left': dist_left,
-        'mtx_right': mtx_right,
-        'dist_right': dist_right,
-        'R': R,
-        'T': T,
-        'E': E,
-        'F': F,
-        'baseline': baseline,
-        'R1': R1,
-        'R2': R2,
-        'P1': P1,
-        'P2': P2,
-        'Q': Q,
-        'image_shape': image_shape,
-        'reprojection_error_left': ret_left,
-        'reprojection_error_right': ret_right,
-        'reprojection_error_stereo': ret_stereo
-    }
-    
-    return calibration
-
-
-def save_calibration(calibration, output_path):
-    """
-    Save calibration parameters to file
-    """
-    Path(output_path).mkdir(parents=True, exist_ok=True)
-    
-    print("\n" + "="*70)
-    print("SAVING CALIBRATION RESULTS")
-    print("="*70 + "\n")
-    
-    # Save as NumPy archive
-    npz_file = os.path.join(output_path, 'stereo_calibration.npz')
-    np.savez(npz_file, **calibration)
-    print(f"Saved calibration to: {npz_file}")
-    
-    # Save as YAML for left camera
-    yaml_left = os.path.join(output_path, 'camera_left.yaml')
-    cv_file = cv2.FileStorage(yaml_left, cv2.FILE_STORAGE_WRITE)
-    cv_file.write("camera_matrix", calibration['mtx_left'])
-    cv_file.write("distortion_coefficients", calibration['dist_left'])
-    cv_file.release()
-    print(f"Saved left camera to: {yaml_left}")
-    
-    # Save as YAML for right camera
-    yaml_right = os.path.join(output_path, 'camera_right.yaml')
-    cv_file = cv2.FileStorage(yaml_right, cv2.FILE_STORAGE_WRITE)
-    cv_file.write("camera_matrix", calibration['mtx_right'])
-    cv_file.write("distortion_coefficients", calibration['dist_right'])
-    cv_file.release()
-    print(f"Saved right camera to: {yaml_right}")
-
-
-def save_visualizations(visualization_data, output_path):
-    """
-    Save corner detection visualizations
-    """
-    if not visualization_data:
-        return
-    
-    print("\nSaving visualizations...")
-    
-    for idx, (img_left, img_right, pattern) in enumerate(visualization_data):
-        # Combine images side by side
-        combined = np.hstack([img_left, img_right])
-        
-        # Add labels
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(combined, 'LEFT CAMERA', (50, 50), font, 1.5, (0, 255, 0), 3)
-        cv2.putText(combined, 'RIGHT CAMERA', (img_left.shape[1] + 50, 50), font, 1.5, (0, 255, 0), 3)
-        cv2.putText(combined, f'Pattern: {pattern[0]}x{pattern[1]}', (50, combined.shape[0] - 30), 
-                   font, 1.0, (255, 255, 255), 2)
-        
-        # Save
-        output_file = os.path.join(output_path, f'corner_detection_{pattern[0]}x{pattern[1]}.png')
-        cv2.imwrite(output_file, combined)
-        print(f"  Saved: {output_file}")
-
-
-def print_calibration_results(calibration):
-    """
-    Print calibration results in readable format
-    """
-    print("\n" + "="*70)
-    print("CALIBRATION RESULTS")
-    print("="*70 + "\n")
-    
-    print("LEFT CAMERA:")
-    print(f"  Focal length:    fx = {calibration['mtx_left'][0,0]:.2f} px")
-    print(f"                   fy = {calibration['mtx_left'][1,1]:.2f} px")
-    print(f"  Principal point: cx = {calibration['mtx_left'][0,2]:.2f} px")
-    print(f"                   cy = {calibration['mtx_left'][1,2]:.2f} px")
-    print(f"  Distortion:      {calibration['dist_left'].ravel()}")
-    
-    print("\nRIGHT CAMERA:")
-    print(f"  Focal length:    fx = {calibration['mtx_right'][0,0]:.2f} px")
-    print(f"                   fy = {calibration['mtx_right'][1,1]:.2f} px")
-    print(f"  Principal point: cx = {calibration['mtx_right'][0,2]:.2f} px")
-    print(f"                   cy = {calibration['mtx_right'][1,2]:.2f} px")
-    print(f"  Distortion:      {calibration['dist_right'].ravel()}")
-    
-    print("\nSTEREO PARAMETERS:")
-    print(f"  Baseline:        {calibration['baseline']:.6f} m ({calibration['baseline']*100:.2f} cm)")
-    print(f"  Translation:     {calibration['T'].ravel()}")
-
-
-def compare_with_reference(calibration, reference_path, output_path):
-    """
-    Compare calibration results with reference calibration
-    """
-    if not os.path.exists(reference_path):
-        print(f"\nReference calibration not found: {reference_path}")
-        return
-    
-    print("\n" + "="*70)
-    print("COMPARISON WITH REFERENCE CALIBRATION")
-    print("="*70 + "\n")
-    
-    ref = np.load(reference_path)
-    
-    # Extract reference values
-    ref_fx_l = ref['mtx_left'][0, 0]
-    ref_fy_l = ref['mtx_left'][1, 1]
-    ref_cx_l = ref['mtx_left'][0, 2]
-    ref_cy_l = ref['mtx_left'][1, 2]
-    ref_baseline = ref.get('baseline', np.linalg.norm(ref['T']))
-    
-    # Extract computed values
-    fx_l = calibration['mtx_left'][0, 0]
-    fy_l = calibration['mtx_left'][1, 1]
-    cx_l = calibration['mtx_left'][0, 2]
-    cy_l = calibration['mtx_left'][1, 2]
-    baseline = calibration['baseline']
-    
-    # Print comparison
-    print(f"{'Parameter':<20} {'Your Value':>15} {'Reference':>15} {'Difference':>15}")
-    print("-" * 65)
-    print(f"{'fx (left)':<20} {fx_l:>15.2f} {ref_fx_l:>15.2f} {abs(fx_l - ref_fx_l):>15.2f}")
-    print(f"{'fy (left)':<20} {fy_l:>15.2f} {ref_fy_l:>15.2f} {abs(fy_l - ref_fy_l):>15.2f}")
-    print(f"{'cx (left)':<20} {cx_l:>15.2f} {ref_cx_l:>15.2f} {abs(cx_l - ref_cx_l):>15.2f}")
-    print(f"{'cy (left)':<20} {cy_l:>15.2f} {ref_cy_l:>15.2f} {abs(cy_l - ref_cy_l):>15.2f}")
-    print(f"{'Baseline (m)':<20} {baseline:>15.6f} {ref_baseline:>15.6f} {abs(baseline - ref_baseline):>15.6f}")
-    
-    # Save comparison to file
-    comp_file = os.path.join(output_path, 'calibration_comparison.txt')
-    with open(comp_file, 'w') as f:
-        f.write("="*70 + "\n")
-        f.write("CALIBRATION COMPARISON\n")
-        f.write("="*70 + "\n\n")
-        f.write(f"Reprojection error: {calibration['reprojection_error_stereo']:.4f} pixels\n")
-        f.write(f"Your baseline: {baseline:.6f} m\n")
-        f.write(f"Reference baseline: {ref_baseline:.6f} m\n")
-        f.write(f"Baseline difference: {abs(baseline - ref_baseline):.6f} m\n\n")
-        f.write("Small differences are expected due to:\n")
-        f.write("  - Different corner detection accuracy\n")
-        f.write("  - Optimization convergence variations\n")
-        f.write("  - Sub-pixel refinement differences\n")
-    
-    print(f"\nComparison saved to: {comp_file}")
+def match_boards(left_boards, right_boards, max_dist=MAX_MATCH_DISTANCE_PX):
+    matches = []
+    used_r = set()
+    for l in left_boards:
+        lx, ly = l['centroid']
+        best = None
+        bestd = float('inf')
+        for idx, r in enumerate(right_boards):
+            if idx in used_r:
+                continue
+            rx, ry = r['centroid']
+            d = hypot(lx - rx, ly - ry)
+            if d < bestd:
+                bestd = d
+                best = idx
+        if best is not None and bestd <= max_dist:
+            used_r.add(best)
+            matches.append((l, right_boards[best]))
+    return matches
 
 
 def main():
-    """
-    Main calibration workflow
-    """
-    print("\n" + "="*70)
-    print("STEREO CAMERA CALIBRATION")
-    print("DTU Course 34759 - Perception for Autonomous Systems")
-    print("="*70)
-    
-    # Load image pairs
-    print("\nLoading image pairs...")
-    image_pairs = get_image_pairs(LEFT_IMAGES_PATH, RIGHT_IMAGES_PATH)
-    print(f"Found {len(image_pairs)} stereo image pairs")
-    
-    # Collect calibration data
-    objpoints, imgpoints_left, imgpoints_right, image_shape, visualizations = collect_calibration_data(
-        image_pairs, CHECKERBOARD_PATTERNS, SQUARE_SIZE_METERS
-    )
-    
-    if len(objpoints) == 0:
-        print("\nERROR: No checkerboard corners detected!")
-        print("Please check:")
-        print("  1. Image paths are correct")
-        print("  2. Checkerboard pattern size is correct")
-        print("  3. Images contain visible checkerboards")
+    print("Starting stereo camera calibration...")
+
+    base_dir = os.path.dirname(os.path.dirname(calibration_images_path))
+    left_path = os.path.join(base_dir, 'image_02', 'data', '*.png')
+    right_path = os.path.join(base_dir, 'image_03', 'data', '*.png')
+
+    left_images = sorted(glob.glob(left_path))
+    right_images = sorted(glob.glob(right_path))
+
+    if len(left_images) == 0 or len(right_images) == 0:
+        print("Error: No calibration images found.")
+        print(f"Left path: {left_path}")
+        print(f"Right path: {right_path}")
         return
-    
-    # Perform calibration
-    calibration = perform_calibration(objpoints, imgpoints_left, imgpoints_right, image_shape)
-    
-    # Save results
-    save_calibration(calibration, OUTPUT_PATH)
-    save_visualizations(visualizations, OUTPUT_PATH)
-    
-    # Print results
-    print_calibration_results(calibration)
-    
-    # Compare with reference
-    compare_with_reference(calibration, REFERENCE_CALIBRATION, OUTPUT_PATH)
-    
-    print("\n" + "="*70)
-    print("CALIBRATION COMPLETE")
-    print("="*70)
-    print(f"\nAll results saved to: {OUTPUT_PATH}/")
-    print("\nReady for next step: Image Rectification")
-    print()
+
+    print(f"Found {len(left_images)} image pairs")
+
+    objPointss = []
+    imgPointssL = []
+    imgPointssR = []
+
+    total_detections = 0
+    total_matches = 0
+
+    for idx, (lf, rf) in enumerate(zip(left_images, right_images)):
+        left_color = cv2.imread(lf)
+        right_color = cv2.imread(rf)
+        if left_color is None or right_color is None:
+            print(f"Warning: Could not read image pair {idx}. Skipping.")
+            continue
+
+        left_gray = cv2.cvtColor(left_color, cv2.COLOR_BGR2GRAY)
+        right_gray = cv2.cvtColor(right_color, cv2.COLOR_BGR2GRAY)
+
+        left_boards = detect_multiple_boards(left_gray.copy(), CHESSBOARD_CANDIDATES)
+        right_boards = detect_multiple_boards(right_gray.copy(), CHESSBOARD_CANDIDATES)
+
+        total_detections += len(left_boards) + len(right_boards)
+        matches = match_boards(left_boards, right_boards, MAX_MATCH_DISTANCE_PX)
+        total_matches += len(matches)
+
+        for (l, r) in matches:
+            if l['corners'] is None or r['corners'] is None or l.get('size') != r.get('size'):
+                continue
+            size = l['size']
+            expected_count = size[0] * size[1]
+            if l['corners'].shape[0] != expected_count or r['corners'].shape[0] != expected_count:
+                continue
+
+            objp = np.zeros((expected_count, 3), np.float32)
+            objp[:, :2] = np.mgrid[0:size[0], 0:size[1]].T.reshape(-1, 2)
+            objp *= SQUARE_SIZE
+
+            objPointss.append(objp)
+            imgPointssL.append(l['corners'])
+            imgPointssR.append(r['corners'])
+
+        # Diagnostics image
+        diag = np.hstack((left_color.copy(), right_color.copy()))
+        w = left_color.shape[1]
+        for b in left_boards:
+            try:
+                cv2.drawChessboardCorners(diag[:, :w], b['size'], b['corners'], True)
+            except Exception:
+                pass
+        for b in right_boards:
+            try:
+                cv2.drawChessboardCorners(diag[:, w:], b['size'], b['corners'], True)
+            except Exception:
+                pass
+
+        diag_path = os.path.join(DIAG_DIR, f'pair_{idx:03d}_{os.path.basename(lf)}')
+        if not diag_path.lower().endswith('.png'):
+            diag_path += '.png'
+        cv2.imwrite(diag_path, diag)
+
+    print(f"Total detections: {total_detections}, matched pairs: {total_matches}")
+    print(f"Final correspondences: {len(objPointss)}")
+    if len(objPointss) == 0:
+        print(f"No matched boards found. Check diagnostics in {DIAG_DIR}")
+        return
+
+    # Trim lists to equal length
+    min_len = min(len(objPointss), len(imgPointssL), len(imgPointssR))
+    objPointss = objPointss[:min_len]
+    imgPointssL = imgPointssL[:min_len]
+    imgPointssR = imgPointssR[:min_len]
+
+    img_shape = (left_gray.shape[1], left_gray.shape[0])
+
+    # Calibrate individual cameras
+    print("Calibrating left camera...")
+    retL, mtxL, distL, rvecsL, tvecsL = cv2.calibrateCamera(objPointss, imgPointssL, img_shape, None, None)
+    print("Calibrating right camera...")
+    retR, mtxR, distR, rvecsR, tvecsR = cv2.calibrateCamera(objPointss, imgPointssR, img_shape, None, None)
+
+    # Stereo calibration
+    print("Running stereoCalibrate...")
+    flags = cv2.CALIB_FIX_INTRINSIC
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, 1e-6)
+    ret, _, _, _, _, R, T, E, F = cv2.stereoCalibrate(
+        objPointss, imgPointssL, imgPointssR,
+        mtxL, distL, mtxR, distR, img_shape,
+        criteria=criteria, flags=flags
+    )
+    print(f"Stereo reprojection error: {ret:.6f}")
+
+    # Rectification
+    R1, R2, P1, P2, Q, roi1, roi2 = cv2.stereoRectify(
+        mtxL, distL, mtxR, distR, img_shape, R, T,
+        flags=cv2.CALIB_ZERO_DISPARITY, alpha=-1
+    )
+
+    # ----------------- SAVE calib.npz -----------------
+    np.savez(SAVE_CALIBRATION,
+             mtxL=mtxL, distL=distL,
+             mtxR=mtxR, distR=distR,
+             R=R, T=T, R1=R1, R2=R2, P1=P1, P2=P2, Q=Q)
+    print("Calibration saved to:", SAVE_CALIBRATION)
+
+    # ----------------- SAVE calib.yaml -----------------
+    yaml_file = os.path.splitext(SAVE_CALIBRATION)[0] + '.yaml'
+    fs = cv2.FileStorage(yaml_file, cv2.FILE_STORAGE_WRITE)
+    fs.write("mtxL", mtxL)
+    fs.write("distL", distL)
+    fs.write("mtxR", mtxR)
+    fs.write("distR", distR)
+    fs.write("R", R)
+    fs.write("T", T)
+    fs.write("R1", R1)
+    fs.write("R2", R2)
+    fs.write("P1", P1)
+    fs.write("P2", P2)
+    fs.write("Q", Q)
+    fs.release()
+    print("Calibration also saved to YAML:", yaml_file)
+
+    # ----------------- SAVE calib_corners.png -----------------
+    last_left = cv2.imread(left_images[0])
+    last_right = cv2.imread(right_images[0])
+    for b in detect_multiple_boards(cv2.cvtColor(last_left, cv2.COLOR_BGR2GRAY), CHESSBOARD_CANDIDATES):
+        try:
+            cv2.drawChessboardCorners(last_left, b['size'], b['corners'], True)
+        except Exception:
+            pass
+    for b in detect_multiple_boards(cv2.cvtColor(last_right, cv2.COLOR_BGR2GRAY), CHESSBOARD_CANDIDATES):
+        try:
+            cv2.drawChessboardCorners(last_right, b['size'], b['corners'], True)
+        except Exception:
+            pass
+    cv2.imwrite(os.path.join(os.path.dirname(SAVE_CALIBRATION), 'calib_corners.png'),
+                np.hstack((last_left, last_right)))
+
+    # ----------------- SAVE calib_rectified.png -----------------
+    map1x, map1y = cv2.initUndistortRectifyMap(mtxL, distL, R1, P1, img_shape, cv2.CV_32FC1)
+    map2x, map2y = cv2.initUndistortRectifyMap(mtxR, distR, R2, P2, img_shape, cv2.CV_32FC1)
+    rectL = cv2.remap(last_left, map1x, map1y, cv2.INTER_LINEAR)
+    rectR = cv2.remap(last_right, map2x, map2y, cv2.INTER_LINEAR)
+
+    # Draw rectified corners
+    for pts in imgPointssL[0:1]:
+        pts_rect = cv2.undistortPoints(pts, mtxL, distL, R=R1, P=P1)
+        for p in pts_rect:
+            x, y = int(p[0][0]), int(p[0][1])
+            cv2.circle(rectL, (x, y), 5, (0, 0, 255), -1)
+    for pts in imgPointssR[0:1]:
+        pts_rect = cv2.undistortPoints(pts, mtxR, distR, R=R2, P=P2)
+        for p in pts_rect:
+            x, y = int(p[0][0]), int(p[0][1])
+            cv2.circle(rectR, (x, y), 5, (0, 0, 255), -1)
+
+    # Draw horizontal lines
+    h = rectL.shape[0]
+    step = max(20, h // 10)
+    for y in range(0, h, step):
+        cv2.line(rectL, (0, y), (rectL.shape[1], y), (0, 255, 0), 1)
+        cv2.line(rectR, (0, y), (rectR.shape[1], y), (0, 255, 0), 1)
+
+    cv2.imwrite(os.path.join(os.path.dirname(SAVE_CALIBRATION), 'calib_rectified.png'),
+                np.hstack((rectL, rectR)))
+
+    print(f"Per-pair diagnostics saved in: {DIAG_DIR}")
+    print("Finished successfully.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
