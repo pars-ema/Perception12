@@ -5,7 +5,7 @@ import glob
 from math import hypot
 
 # CRITICAL PARAMETER FOR PRUNING:
-MAX_REPROJ_ERROR_FOR_PRUNING = 1.0 # Discard any board with an error higher than 1.0 pixel.
+MAX_REPROJ_ERROR_FOR_PRUNING = 1.0 
 
 # ======================= USER CONFIGURABLE PARAMETERS =======================
 calibration_images_path = 'Final_Project/data/34759_final_project_raw/calib/image_02/data'
@@ -24,10 +24,8 @@ os.makedirs(DIAG_DIR, exist_ok=True)
 # ======================= END OF USER CONFIGURABLE PARAMETERS =================
 
 def _refine_corners(gray, corners):
-    # Increased max_iter for sub-pixel refinement
     return cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1),
                             (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-4))
-
 
 def preprocess_versions(gray):
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
@@ -38,7 +36,6 @@ def preprocess_versions(gray):
     ath = cv2.adaptiveThreshold(g_clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                 cv2.THRESH_BINARY, 11, 2)
     return [g_clahe, g_blur, edges, ath]
-
 
 def detect_multiple_boards(gray_img, candidates):
     boards = []
@@ -162,11 +159,8 @@ def prune_outliers(objPointss, imgPointssL, imgPointssR, mtxL, distL, rvecsL, tv
     new_imgPointssR = []
     rejected_count = 0
 
-    # Calculate reprojection error for each set of points
     for i in range(len(objPointss)):
         imgpoints_reproj, _ = cv2.projectPoints(objPointss[i], rvecsL[i], tvecsL[i], mtxL, distL)
-        
-        # Calculate the error for this board
         error = cv2.norm(imgPointssL[i], imgpoints_reproj, cv2.NORM_L2) / len(imgPointssL[i])
         
         if error <= threshold:
@@ -180,19 +174,17 @@ def prune_outliers(objPointss, imgPointssL, imgPointssR, mtxL, distL, rvecsL, tv
 
 
 def main():
-    print("Starting stereo camera calibration...")
+    print("Starting stereo camera calibration (Attempting full 8-param distortion model with visualization)...")
 
-    base_dir = os.path.dirname(os.path.dirname(calibration_images_path))
-    left_path = os.path.join(base_dir, 'image_02', 'data', '*.png')
-    right_path = os.path.join(base_dir, 'image_03', 'data', '*.png')
+    # Corrected path logic for the environment
+    left_path = 'Final_Project/data/34759_final_project_raw/calib/image_02/data/*.png'
+    right_path = 'Final_Project/data/34759_final_project_raw/calib/image_03/data/*.png'
 
     left_images = sorted(glob.glob(left_path))
     right_images = sorted(glob.glob(right_path))
 
     if len(left_images) == 0 or len(right_images) == 0:
-        print("Error: No calibration images found.")
-        print(f"Left path: {left_path}")
-        print(f"Right path: {right_path}")
+        print("Error: No calibration images found. Please verify the paths.")
         return
 
     print(f"Found {len(left_images)} image pairs")
@@ -200,16 +192,19 @@ def main():
     objPointss = []
     imgPointssL = []
     imgPointssR = []
+    
+    # Store all matched points for visualization on the first image later
+    all_matched_boards_L = []
+    all_matched_boards_R = []
 
     total_detections = 0
     total_matches = 0
 
-    # Data collection loop (with diagnostics re-enabled)
+    # Data collection loop
     for idx, (lf, rf) in enumerate(zip(left_images, right_images)):
         left_color = cv2.imread(lf)
         right_color = cv2.imread(rf)
         if left_color is None or right_color is None:
-            print(f"Warning: Could not read image pair {idx}. Skipping.")
             continue
 
         left_gray = cv2.cvtColor(left_color, cv2.COLOR_BGR2GRAY)
@@ -237,8 +232,13 @@ def main():
             objPointss.append(objp)
             imgPointssL.append(l['corners'])
             imgPointssR.append(r['corners'])
+            
+            # Save boards for full corner visualization on the first image
+            if idx == 0:
+                all_matched_boards_L.append(l)
+                all_matched_boards_R.append(r)
         
-        # Diagnostics image (RE-ENABLED)
+        # Diagnostics image (per-pair)
         diag = np.hstack((left_color.copy(), right_color.copy()))
         w = left_color.shape[1]
         for b in left_boards:
@@ -257,22 +257,21 @@ def main():
             diag_path += '.png'
         cv2.imwrite(diag_path, diag) # Write the diagnostics image
 
+
     print(f"Total detections: {total_detections}, matched pairs: {total_matches}")
     initial_correspondences = len(objPointss)
     print(f"Final correspondences (initial set): {initial_correspondences}")
     if initial_correspondences == 0:
-        print(f"No matched boards found. Check diagnostics in {DIAG_DIR}")
+        print("No matched boards found.")
         return
 
-    # Trim lists to equal length
     img_shape = (left_gray.shape[1], left_gray.shape[0])
 
     # --- Step 1: Preliminary Single Calibration for Pruning ---
     print("\n--- Calibration Pass 1: For Data Pruning ---")
-    # Use standard 5-coefficient model (K1, K2, P1, P2, K3) for stability
-    single_calib_flags = (cv2.CALIB_FIX_K4 | cv2.CALIB_FIX_K5 | cv2.CALIB_FIX_K6 | cv2.CALIB_FIX_PRINCIPAL_POINT)
+    single_calib_flags_prune = (cv2.CALIB_FIX_K4 | cv2.CALIB_FIX_K5 | cv2.CALIB_FIX_K6 | cv2.CALIB_FIX_PRINCIPAL_POINT)
     retL_init, mtxL_init, distL_init, rvecsL_init, tvecsL_init = cv2.calibrateCamera(
-        objPointss, imgPointssL, img_shape, None, None, flags=single_calib_flags
+        objPointss, imgPointssL, img_shape, None, None, flags=single_calib_flags_prune
     )
     print(f"Initial Left Camera Reprojection Error: {retL_init:.3f}")
 
@@ -286,9 +285,6 @@ def main():
     print(f"Pruning complete: Rejected {rejected_count} board(s) with error > {MAX_REPROJ_ERROR_FOR_PRUNING} pixel.")
     pruned_correspondences = len(objPointss_pruned)
     print(f"Final correspondences (pruned set): {pruned_correspondences}")
-
-    if pruned_correspondences < 10:
-        print("\n⚠️ WARNING: Not enough high-quality data remains for robust calibration. You must capture more data.")
     
     # Use the pruned data set for the final calibration pass
     objPointss = objPointss_pruned
@@ -298,23 +294,23 @@ def main():
     # --- Step 3: Final Single and Stereo Calibration with Pruned Data ---
     print("\n--- Calibration Pass 2: Final Calibration ---")
     
-    print("Calibrating left camera...")
+    # NEW FLAG: Allowing all 8 distortion coefficients to be estimated
+    single_calib_flags_final = (cv2.CALIB_FIX_PRINCIPAL_POINT) 
+
+    print("Calibrating left camera (full model)...")
     retL, mtxL, distL, rvecsL, tvecsL = cv2.calibrateCamera(
-        objPointss, imgPointssL, img_shape, None, None, flags=single_calib_flags
+        objPointss, imgPointssL, img_shape, None, None, flags=single_calib_flags_final
     )
     print(f"Left camera reprojection error: {retL:.3f}")
 
-    print("Calibrating right camera...")
+    print("Calibrating right camera (full model)...")
     retR, mtxR, distR, rvecsR, tvecsR = cv2.calibrateCamera(
-        objPointss, imgPointssR, img_shape, None, None, flags=single_calib_flags
+        objPointss, imgPointssR, img_shape, None, None, flags=single_calib_flags_final
     )
     print(f"Right camera reprojection error: {retR:.3f}")
 
     print("Running stereoCalibrate...")
-    # REVERTED: Using CALIB_USE_INTRINSIC_GUESS to allow the solver more flexibility with sparse data
     stereo_flags = (cv2.CALIB_USE_INTRINSIC_GUESS |
-             cv2.CALIB_FIX_K1 | cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3 |
-             cv2.CALIB_FIX_TANGENT_DIST |
              cv2.CALIB_FIX_PRINCIPAL_POINT)
              
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 500, 1e-7)
@@ -364,12 +360,16 @@ def main():
     corners_left = last_left.copy()
     corners_right = last_right.copy()
 
-    for b in detect_multiple_boards(cv2.cvtColor(corners_left, cv2.COLOR_BGR2GRAY), CHESSBOARD_CANDIDATES):
+    # Draw *all* detected corners (matched or not) for visualization
+    temp_left_boards = detect_multiple_boards(cv2.cvtColor(corners_left, cv2.COLOR_BGR2GRAY), CHESSBOARD_CANDIDATES)
+    temp_right_boards = detect_multiple_boards(cv2.cvtColor(corners_right, cv2.COLOR_BGR2GRAY), CHESSBOARD_CANDIDATES)
+
+    for b in temp_left_boards:
         try:
             cv2.drawChessboardCorners(corners_left, b['size'], b['corners'], True)
         except Exception:
             pass
-    for b in detect_multiple_boards(cv2.cvtColor(corners_right, cv2.COLOR_BGR2GRAY), CHESSBOARD_CANDIDATES):
+    for b in temp_right_boards:
         try:
             cv2.drawChessboardCorners(corners_right, b['size'], b['corners'], True)
         except Exception:
@@ -395,7 +395,7 @@ def main():
                 np.hstack((rectL, rectR)))
 
     print(f"Per-pair diagnostics saved in: {DIAG_DIR}")
-    print("Finished successfully. Please run this code and report the resulting Stereo reprojection error.")
+    print("Finished successfully. Please examine the newly generated images.")
 
 
 if __name__ == "__main__":
