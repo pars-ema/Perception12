@@ -4,101 +4,163 @@ import numpy as np
 import cv2
 
 # ======================= CONFIG =======================
-CALIB_FILE = "Final_Project/models/stereo_calibration.npz"
+# Path to the calibration file generated in Step 1
+CALIB_NPZ = "Final_Project/models/stereo_calibration.npz"
 
-# RAW calibration checkerboard images
-CALIB_LEFT_DIR  = "Final_Project/data/34759_final_project_raw/calib/image_02/data"
-CALIB_RIGHT_DIR = "Final_Project/data/34759_final_project_raw/calib/image_03/data"
+# Root folder containing the raw, unrectified sequence data
+# We assume this structure: RAW_ROOT/seq_xx/image_02/data/*.png (Left)
+# and RAW_ROOT/seq_xx/image_03/data/*.png (Right)
+RAW_ROOT = "Final_Project/data/34759_final_project_raw" 
 
-# TEACHER rectified calibration images (if you want comparison)
-# In your tree, teacher rectified data is under 34759_final_project_rect
-TEACHER_LEFT_DIR  = "Final_Project/data/34759_final_project_rect/calib/image_02/data"
-TEACHER_RIGHT_DIR = "Final_Project/data/34759_final_project_rect/calib/image_03/data"
-
-OUT_DIR = "Final_Project/results/rectified"
-OUT_YOURS = os.path.join(OUT_DIR, "our_rectified.png")
-OUT_COMPARE = os.path.join(OUT_DIR, "teacher_vs_yours.png")
-os.makedirs(OUT_DIR, exist_ok=True)
-
-EPILINE_STEP = 50
+# Output folder for the new, perfectly rectified images.
+# This folder is what the disparity/depth script (Step 3) will use.
+OUT_RECTIFIED_ROOT = "Final_Project/results/rectified"
 # ======================================================
 
-def load_calibration(npz_path):
-    data = np.load(npz_path)
-    return (data["mtxL"], data["distL"],
-            data["mtxR"], data["distR"],
-            data["R1"], data["R2"],
-            data["P1"], data["P2"])
+def load_calibration_maps(calib_path, img_shape):
+    """
+    Loads all required matrices from the NPZ file and computes the
+    undistort and rectify mapping matrices for both cameras.
+    """
+    data = np.load(calib_path, allow_pickle=True)
+    
+    # Intrinsic and Extrinsic Matrices
+    mtxL = data["mtxL"]
+    distL = data["distL"]
+    mtxR = data["mtxR"]
+    distR = data["distR"]
+    
+    # Rectification Matrices
+    R1 = data["R1"]
+    P1 = data["P1"]
+    R2 = data["R2"]
+    P2 = data["P2"]
 
-def list_pngs(d):
-    return sorted(glob.glob(os.path.join(d, "*.png")))
-
-def pick_first_pair(left_dir, right_dir):
-    left_files = list_pngs(left_dir)
-    right_files = list_pngs(right_dir)
-    if not left_files or not right_files:
-        raise FileNotFoundError("No calibration images found.")
-    # Pair by sorted order (calib folders are aligned)
-    return left_files[0], right_files[0]
-
-def build_maps(calib, img_shape):
-    mtxL, distL, mtxR, distR, R1, R2, P1, P2 = calib
+    # Compute the rectification maps
+    # map1x, map1y: maps for the Left camera (R1/P1)
     map1x, map1y = cv2.initUndistortRectifyMap(
         mtxL, distL, R1, P1, img_shape, cv2.CV_32FC1
     )
+    # map2x, map2y: maps for the Right camera (R2/P2)
     map2x, map2y = cv2.initUndistortRectifyMap(
         mtxR, distR, R2, P2, img_shape, cv2.CV_32FC1
     )
-    return map1x, map1y, map2x, map2y
 
-def rectify_pair(imgL, imgR, maps):
-    map1x, map1y, map2x, map2y = maps
-    rectL = cv2.remap(imgL, map1x, map1y, cv2.INTER_LINEAR)
-    rectR = cv2.remap(imgR, map2x, map2y, cv2.INTER_LINEAR)
-    return rectL, rectR
+    print("Successfully computed rectification maps.")
+    return (map1x, map1y), (map2x, map2y)
 
-def draw_epipolar_lines(img, step=50):
-    out = img.copy()
-    h, w = out.shape[:2]
-    for y in range(0, h, step):
-        cv2.line(out, (0, y), (w, y), (0, 255, 0), 1)
-    return out
+
+def find_raw_sequences(raw_root):
+    """
+    Finds sequence folders and returns the raw image directories.
+    Returns dict: {seq_name: (raw_left_dir, raw_right_dir)}
+    """
+    seq_map = {}
+    
+    seqs = sorted([d for d in os.listdir(raw_root) if d.startswith("seq_")])
+
+    for s in seqs:
+        seq_path = os.path.join(raw_root, s)
+        
+        # Adjust paths based on your data structure, assuming KITTI-like layout
+        left_dir = os.path.join(seq_path, "image_02", "data") 
+        right_dir = os.path.join(seq_path, "image_03", "data")
+        
+        if os.path.isdir(left_dir) and os.path.isdir(right_dir):
+            seq_map[s] = (left_dir, right_dir)
+        else:
+            print(f"Warning: Skipping {s}, expected raw subdirectories not found.")
+            
+    return seq_map
+
+
+def process_sequence_rectification(seq_name, raw_left_dir, raw_right_dir, mapsL, mapsR):
+    """
+    Applies rectification maps to all images in a sequence and saves them.
+    """
+    # 1. Define input/output paths
+    left_files = sorted(glob.glob(os.path.join(raw_left_dir, "*.png")))
+    right_files = sorted(glob.glob(os.path.join(raw_right_dir, "*.png")))
+    
+    if not left_files or not right_files:
+        print(f"[{seq_name}] No images found to rectify.")
+        return
+
+    n = min(len(left_files), len(right_files))
+    
+    # Output structure matches the input structure to make Step 3 happy
+    out_seq_root = os.path.join(OUT_RECTIFIED_ROOT, seq_name)
+    out_left_dir = os.path.join(out_seq_root, "image_02", "data")
+    out_right_dir = os.path.join(out_seq_root, "image_03", "data")
+    
+    os.makedirs(out_left_dir, exist_ok=True)
+    os.makedirs(out_right_dir, exist_ok=True)
+    
+    map1x, map1y = mapsL
+    map2x, map2y = mapsR
+    
+    print(f"[{seq_name}] Rectifying and saving {n} image pairs...")
+
+    for i in range(n):
+        lf = left_files[i]
+        rf = right_files[i]
+        
+        # Read the raw images
+        imgL = cv2.imread(lf, cv2.IMREAD_COLOR)
+        imgR = cv2.imread(rf, cv2.IMREAD_COLOR)
+        
+        if imgL is None or imgR is None:
+            continue
+            
+        # Apply rectification (Undistortion + Rotation/Shear)
+        rectL = cv2.remap(imgL, map1x, map1y, cv2.INTER_LINEAR)
+        rectR = cv2.remap(imgR, map2x, map2y, cv2.INTER_LINEAR)
+        
+        # Save to the new rectified structure
+        base_name = os.path.basename(lf)
+        cv2.imwrite(os.path.join(out_left_dir, base_name), rectL)
+        cv2.imwrite(os.path.join(out_right_dir, base_name), rectR)
+
+    print(f"[{seq_name}] Rectification complete. Saved to {out_seq_root}")
+
 
 def main():
-    calib = load_calibration(CALIB_FILE)
+    print("\n=== STEP 2: BATCH RECTIFICATION OF RAW IMAGES ===")
 
-    # --- YOUR rectification on calib pair ---
-    l_path, r_path = pick_first_pair(CALIB_LEFT_DIR, CALIB_RIGHT_DIR)
-    imgL = cv2.imread(l_path)
-    imgR = cv2.imread(r_path)
+    if not os.path.isfile(CALIB_NPZ):
+        raise FileNotFoundError(f"Calibration file not found: {CALIB_NPZ}. Run calibration script first.")
 
-    h, w = imgL.shape[:2]
-    maps = build_maps(calib, (w, h))
-    rectL, rectR = rectify_pair(imgL, imgR, maps)
+    # Find sequences in the RAW data folder
+    seq_map = find_raw_sequences(RAW_ROOT)
+    if not seq_map:
+        raise RuntimeError(f"No raw sequences found in {RAW_ROOT}. Cannot proceed with rectification.")
 
-    rectL_lines = draw_epipolar_lines(rectL, EPILINE_STEP)
-    rectR_lines = draw_epipolar_lines(rectR, EPILINE_STEP)
+    # Determine image shape from the first image
+    first_left_dir = next(iter(seq_map.values()))[0]
+    first_image = glob.glob(os.path.join(first_left_dir, "*.png"))
+    if not first_image:
+        raise RuntimeError("Could not find any image to determine image size.")
+        
+    test_img = cv2.imread(first_image[0], cv2.IMREAD_COLOR)
+    if test_img is None:
+        raise RuntimeError("Failed to read test image for size check.")
+        
+    img_shape = (test_img.shape[1], test_img.shape[0]) # (width, height)
+    print(f"Detected image resolution: {img_shape[0]}x{img_shape[1]}")
 
-    yours = np.hstack([rectL_lines, rectR_lines])
-    cv2.imwrite(OUT_YOURS, yours)
-    print(" Saved YOUR rectified calib pair:", OUT_YOURS)
+    # Load calibration and compute maps only once
+    mapsL, mapsR = load_calibration_maps(CALIB_NPZ, img_shape)
+    
+    # Ensure output root exists
+    os.makedirs(OUT_RECTIFIED_ROOT, exist_ok=True)
 
-    # --- TEACHER vs YOURS comparison (optional but PDF asks for it) ---
-    teach_left = list_pngs(TEACHER_LEFT_DIR)
-    teach_right = list_pngs(TEACHER_RIGHT_DIR)
-    if teach_left and teach_right:
-        tL = cv2.imread(teach_left[0])
-        tR = cv2.imread(teach_right[0])
+    # Process all sequences
+    for seq, (raw_ld, raw_rd) in seq_map.items():
+        process_sequence_rectification(seq, raw_ld, raw_rd, mapsL, mapsR)
 
-        tL_lines = draw_epipolar_lines(tL, EPILINE_STEP)
-        tR_lines = draw_epipolar_lines(tR, EPILINE_STEP)
-        teacher = np.hstack([tL_lines, tR_lines])
+    print("\nSUCCESS: Batch Rectification is complete.")
+    print("You can now run the Disparity/Depth script (Step 3) with full confidence.")
 
-        compare = np.vstack([yours, teacher])
-        cv2.imwrite(OUT_COMPARE, compare)
-        print(" Saved TEACHER vs YOURS comparison:", OUT_COMPARE)
-    else:
-        print("Teacher rectified calib images not found. Comparison skipped.")
 
 if __name__ == "__main__":
     main()
