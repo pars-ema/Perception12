@@ -1,0 +1,5 @@
+train: YOLO/dataset/images/train
+val: YOLO/dataset/images/val
+
+nc: 3
+names: ["pedestrian", "car", "cyclist"]
